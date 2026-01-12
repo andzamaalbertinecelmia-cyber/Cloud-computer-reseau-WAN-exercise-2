@@ -1,0 +1,142 @@
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/mobility-module.h"
+#include "ns3/lte-module.h"
+#include "ns3/wifi-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/flow-monitor-module.h"
+#include "ns3/netanim-module.h"
+
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE ("TP1Offloading");
+
+int main (int argc, char *argv[])
+{
+    // --- 1. SETTINGS ---
+    double simTime = 10.0;
+    double offloadTime = 2.0;
+
+    // --- 2. CREATE NODES ---
+    NodeContainer ueNodes, enbNodes, wifiApNode, remoteHostNode;
+    ueNodes.Create (1);
+    enbNodes.Create (1);
+    wifiApNode.Create (1);
+    remoteHostNode.Create (1);
+
+    // --- 3. HELPERS & EPC ---
+    Ptr<LteHelper> lteHelper = CreateObject<LteHelper> ();
+    Ptr<PointToPointEpcHelper> epcHelper = CreateObject<PointToPointEpcHelper> ();
+    lteHelper->SetEpcHelper (epcHelper);
+    Ptr<Node> pgw = epcHelper->GetPgwNode ();
+
+    // --- 4. MOBILITY (Required for NetAnim) ---
+    MobilityHelper mobility;
+    mobility.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
+    mobility.Install (ueNodes);
+    mobility.Install (enbNodes);
+    mobility.Install (wifiApNode);
+    mobility.Install (remoteHostNode);
+    mobility.Install (pgw);
+    mobility.Install (epcHelper->GetSgwNode());
+
+    // --- 5. INTERNET STACK ---
+    InternetStackHelper internet;
+    internet.Install (ueNodes);
+    internet.Install (remoteHostNode);
+    internet.Install (wifiApNode);
+
+    // --- 6. LTE CONFIG ---
+    NetDeviceContainer enbLteDevs = lteHelper->InstallEnbDevice (enbNodes);
+    NetDeviceContainer ueLteDevs = lteHelper->InstallUeDevice (ueNodes);
+    Ipv4InterfaceContainer ueLteIfaces = epcHelper->AssignUeIpv4Address (ueLteDevs);
+    lteHelper->Attach (ueLteDevs.Get (0), enbLteDevs.Get (0));
+
+    // --- 7. WIFI CONFIG (802.11g for stability in 3.35) ---
+    WifiHelper wifi;
+    wifi.SetStandard (WIFI_STANDARD_80211g);
+    wifi.SetRemoteStationManager ("ns3::ArfWifiManager");
+    YansWifiPhyHelper phy;
+    YansWifiChannelHelper channel = YansWifiChannelHelper::Default ();
+    phy.SetChannel (channel.Create ());
+    WifiMacHelper mac;
+    Ssid ssid = Ssid ("ns3-wifi");
+    mac.SetType ("ns3::StaWifiMac", "Ssid", SsidValue (ssid));
+    NetDeviceContainer staDevs = wifi.Install (phy, mac, ueNodes.Get (0));
+    mac.SetType ("ns3::ApWifiMac", "Ssid", SsidValue (ssid));
+    NetDeviceContainer apDevs = wifi.Install (phy, mac, wifiApNode.Get (0));
+
+    // --- 8. IP ASSIGNMENT ---
+    Ipv4AddressHelper address;
+    PointToPointHelper p2p;
+    p2p.SetDeviceAttribute ("DataRate", StringValue ("100Mbps"));
+    p2p.SetChannelAttribute ("Delay", StringValue ("2ms"));
+
+    // RemoteHost to PGW
+    address.SetBase ("1.0.0.0", "255.255.255.0");
+    address.Assign (p2p.Install (remoteHostNode.Get (0), pgw));
+
+    // WiFi Network
+    address.SetBase ("192.168.1.0", "255.255.255.0");
+    Ipv4InterfaceContainer staIfaces = address.Assign (staDevs);
+    address.SetBase ("192.168.2.0", "255.255.255.0");
+    address.Assign (p2p.Install (wifiApNode.Get (0), pgw));
+
+    // --- 9. APPLICATIONS (TP Requirements) ---
+    uint16_t p1=1001, p2=1002, p3=1003, pOff=2001;
+
+    // App 1 (LTE then WiFi): UDP 10 Mbps
+    UdpClientHelper udp1 (ueLteIfaces.GetAddress (0), p1);
+    udp1.SetAttribute ("Interval", TimeValue (Seconds (0.0008))); // 10Mbps
+    udp1.Install (remoteHostNode.Get (0)).Start (Seconds (1.0));
+    udp1.Install (remoteHostNode.Get (0)).Stop (Seconds (offloadTime));
+
+    UdpClientHelper offload (staIfaces.GetAddress (0), pOff);
+    offload.SetAttribute ("Interval", TimeValue (Seconds (0.0008)));
+    offload.Install (remoteHostNode.Get (0)).Start (Seconds (offloadTime));
+
+    // App 2: TCP 50 Mbps (LTE)
+    BulkSendHelper tcp2 ("ns3::TcpSocketFactory", InetSocketAddress (ueLteIfaces.GetAddress (0), p2));
+    tcp2.Install (remoteHostNode.Get (0)).Start (Seconds (1.0));
+
+    // App 3: UDP 100 Kbps (LTE)
+    UdpClientHelper udp3 (ueLteIfaces.GetAddress (0), p3);
+    udp3.SetAttribute ("Interval", TimeValue (Seconds (0.08)));
+    udp3.Install (remoteHostNode.Get (0)).Start (Seconds (1.0));
+
+    // Sinks on UE
+    PacketSinkHelper sink ("ns3::UdpSocketFactory", InetSocketAddress (Ipv4Address::GetAny (), p1));
+    sink.Install (ueNodes.Get (0));
+    sink.SetAttribute ("Local", AddressValue (InetSocketAddress (Ipv4Address::GetAny (), pOff)));
+    sink.Install (ueNodes.Get (0));
+    PacketSinkHelper sinkTcp ("ns3::TcpSocketFactory", InetSocketAddress (Ipv4Address::GetAny (), p2));
+    sinkTcp.Install (ueNodes.Get (0));
+
+    // --- 10. ANIMATION & LABELS ---
+    AnimationInterface anim ("anim_tp1.xml");
+    anim.UpdateNodeDescription (0, "UE (User)");
+    anim.UpdateNodeDescription (1, "EnodeB");
+    anim.UpdateNodeDescription (2, "WiFi AP");
+    anim.UpdateNodeDescription (3, "RemoteHost");
+    anim.UpdateNodeDescription (4, "PGW/SGW");
+    
+    anim.SetConstantPosition (enbNodes.Get(0), 10, 20);
+    anim.SetConstantPosition (ueNodes.Get(0), 30, 30);
+    anim.SetConstantPosition (wifiApNode.Get(0), 50, 20);
+    anim.SetConstantPosition (remoteHostNode.Get(0), 30, 0);
+    anim.SetConstantPosition (pgw, 30, 10);
+
+    FlowMonitorHelper flowmon;
+    Ptr<FlowMonitor> monitor = flowmon.InstallAll ();
+
+    Simulator::Stop (Seconds (simTime));
+    // This generates PCAP files for the LTE and WiFi interfaces
+    lteHelper->EnablePcapUe ("tp1-pcap-ue", ueNodes);
+    phy.EnablePcap ("tp1-pcap-wifi", staDevs.Get(0));
+    Simulator::Run ();
+    monitor->SerializeToXmlFile ("tp1_results.xml", true, true);
+    Simulator::Destroy ();
+    return 0;
+}
